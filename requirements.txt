@@ -1,0 +1,28 @@
+# Core scientific / geospatial stack
+numpy
+scipy
+pandas
+geopandas
+shapely
+pyproj
+rasterio
+scikit-learn
+scikit-image
+opencv-python-headless
+
+# Segmentation model on top of whatever torch+cuda Colab/Kaggle already ships --
+# do NOT `pip install torch` blindly here; check torch.cuda.is_available() first.
+# Reinstalling torch on Colab/Kaggle can break the preinstalled CUDA binding.
+segmentation-models-pytorch
+
+# Data access
+cdsapi>=0.7.7
+copernicusmarine
+requests
+
+# Drift modelling (bundles its own NOAA/PyGnome-derived weathering model)
+opendrift
+
+# SAR preprocessing helper -- wraps SNAP's gpt; alternative to the raw
+# subprocess pattern in src/preprocessing/snap_pipeline.py
+pyroSAR
