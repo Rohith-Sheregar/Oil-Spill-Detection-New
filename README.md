@@ -2,6 +2,19 @@
 
 This is the reference doc for the project. Code scaffolding lives in `src/`.
 
+## Kaggle Module 1 training
+
+The Kaggle-ready notebook and training entrypoint are here:
+
+- `notebooks/kaggle_module1_zenodo_training.ipynb`
+- `src/training/kaggle_module1_train.py`
+- `docs/kaggle_training.md`
+
+Start with the notebook preset `test_smoke`, then move to
+`module1_balanced` after the download/extract/training loop is confirmed.
+The notebook includes all Zenodo archive URLs, but the full set is about
+90 GB compressed before extraction, so it is not the first Kaggle run to try.
+
 ## 1. The three data blockers — resolve in week 1, before model code
 
 | Dependency | Status | Action this week |

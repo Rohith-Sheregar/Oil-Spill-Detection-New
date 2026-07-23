@@ -36,13 +36,13 @@ class SCSEModule(nn.Module):
 
 
 class DeepLabV3PlusSCSE(nn.Module):
-    def __init__(self, in_channels=4, classes=1, input_size=256):
+    def __init__(self, in_channels=4, classes=1, input_size=256, encoder_weights="imagenet"):
         """in_channels=4 for the v0 build (VV, VH, H, alpha); switch to 5
         once the wind-corrected ratio band is ready (week 3-4)."""
         super().__init__()
         self.base = smp.DeepLabV3Plus(
             encoder_name="mobilenet_v2",
-            encoder_weights="imagenet",  # smp adapts the first conv for in_channels != 3
+            encoder_weights=encoder_weights,  # smp adapts the first conv for in_channels != 3
             in_channels=in_channels,
             classes=classes,
         )

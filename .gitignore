@@ -1,0 +1,17 @@
+# Data and generated artifacts
+data/
+outputs/
+module1_outputs/
+*.7z
+*.pt
+*.pth
+*.ckpt
+*.tif
+*.tiff
+*.csv
+
+# Python/Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
