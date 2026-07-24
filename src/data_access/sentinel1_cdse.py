@@ -15,9 +15,22 @@ token endpoint and OData filter/query pattern below are the stable parts.
 import os
 import requests
 
-TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
-CATALOG_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+TOKEN_URL    = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+CATALOG_URL  = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
 DOWNLOAD_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products({product_id})/$value"
+
+# ─── Shipping-lane AOI bounding boxes ─────────────────────────────────────────
+# Format: (min_lon, min_lat, max_lon, max_lat)
+# Source: synopsis Section 1.1 — "Suez Canal approaches, Mediterranean,
+#         South China Sea, Gulf of Mexico" (Zakzouk et al. 2025, Yang et al. 2022)
+SHIPPING_LANE_BBOXES: dict[str, tuple[float, float, float, float]] = {
+    "suez_canal":    (31.5,  27.0,  33.5,  32.0),   # Red Sea approach + Suez Canal axis
+    "mediterranean": (-6.0,  30.0,  36.0,  46.0),   # Full Mediterranean basin
+    "south_china_sea": (105.0, 0.0, 125.0, 25.0),   # South China Sea (Malacca→Taiwan)
+    "gulf_of_mexico": (-98.0, 18.0, -80.0, 30.0),   # Gulf of Mexico shipping corridor
+}
+
+
 
 
 def get_access_token(username: str, password: str) -> str:
@@ -81,7 +94,43 @@ def download_product(product_id: str, out_path: str, token: str, chunk_size: int
     return out_path
 
 
+def search_shipping_lane(
+    lane: str,
+    start_date: str,
+    end_date: str,
+    max_results: int = 50,
+) -> list[dict]:
+    """
+    Convenience wrapper: search a named shipping lane defined in
+    SHIPPING_LANE_BBOXES.
+
+    Parameters
+    ----------
+    lane        : one of "suez_canal", "mediterranean",
+                  "south_china_sea", "gulf_of_mexico"
+    start_date  : 'YYYY-MM-DD'
+    end_date    : 'YYYY-MM-DD'
+    max_results : maximum products to return
+
+    Returns
+    -------
+    List of IW GRDH product dicts (same as search_sentinel1_grd)
+    """
+    if lane not in SHIPPING_LANE_BBOXES:
+        raise ValueError(
+            f"Unknown lane {lane!r}. "
+            f"Available: {list(SHIPPING_LANE_BBOXES.keys())}"
+        )
+    return search_sentinel1_grd(
+        bbox=SHIPPING_LANE_BBOXES[lane],
+        start_date=start_date,
+        end_date=end_date,
+        max_results=max_results,
+    )
+
+
 if __name__ == "__main__":
+
     # Example: Gulf of Mexico, one-week window
     products = search_sentinel1_grd(
         bbox=(-94.0, 27.0, -88.0, 30.0),

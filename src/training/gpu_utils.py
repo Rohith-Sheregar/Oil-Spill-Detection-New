@@ -1,5 +1,5 @@
 """
-OOM probing + retry-with-halving for unattended Colab/Kaggle training runs.
+OOM probing + retry-with-halving for local on-device training runs.
 An OOM mid-epoch on an unattended session just kills the run silently --
 probe the safe batch size once at the start, and wrap the training step so
 a late, data-dependent OOM (e.g. an unusually large connected component, or

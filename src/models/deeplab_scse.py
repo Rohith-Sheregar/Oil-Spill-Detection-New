@@ -36,9 +36,16 @@ class SCSEModule(nn.Module):
 
 
 class DeepLabV3PlusSCSE(nn.Module):
-    def __init__(self, in_channels=4, classes=1, input_size=256, encoder_weights="imagenet"):
-        """in_channels=4 for the v0 build (VV, VH, H, alpha); switch to 5
-        once the wind-corrected ratio band is ready (week 3-4)."""
+    def __init__(self, in_channels=5, classes=1, input_size=256, encoder_weights="imagenet"):
+        """in_channels=5 for synopsis-compliant full_5band mode:
+        Band 0: VV Sigma0 dB (normalised)
+        Band 1: VH Sigma0 dB (normalised)
+        Band 2: Cloude-Pottier Entropy H [0, 1]
+        Band 3: Cloude-Pottier Alpha angle / 90 [0, 1]
+        Band 4: CMOD5.N wind-corrected VV/VH ratio [0, 1]
+        Pass in_channels=4 for the vv_vh_h_alpha mode or in_channels=2/3
+        for the 2/3-band fallback modes defined in zenodo_sos_dataset.py.
+        """
         super().__init__()
         self.base = smp.DeepLabV3Plus(
             encoder_name="mobilenet_v2",
@@ -64,6 +71,24 @@ class DeepLabV3PlusSCSE(nn.Module):
             dec = self.base.decoder(self.base.encoder(dummy))
         self.scse = SCSEModule(dec.shape[1])
 
+        # Verify the encoder name is still valid for your installed smp
+        # version: smp.encoders.get_encoder_names()
+        #
+        # Two things verified against a real install (smp 0.5.0) that are
+        # easy to get wrong by analogy with older smp versions/tutorials:
+        #   1. decoder.forward() takes the encoder's feature list as ONE
+        #      argument (`decoder(features)`), not unpacked (`decoder(*features)`).
+        #   2. the dummy probe batch must be >1 -- ASPP's global-pooling
+        #      branch collapses spatial dims to 1x1, and BatchNorm raises
+        #      ("Expected more than 1 value per channel when training") on
+        #      a batch of 1 in training mode. torch.no_grad() does NOT put
+        #      the module in eval mode, so this bites even though no
+        #      gradients are computed.
+        with torch.no_grad():
+            dummy = torch.zeros(2, in_channels, input_size, input_size)
+            dec = self.base.decoder(self.base.encoder(dummy))
+        self.scse = SCSEModule(dec.shape[1])
+
     def forward(self, x):
         feats = self.base.encoder(x)
         dec = self.base.decoder(feats)
@@ -71,10 +96,13 @@ class DeepLabV3PlusSCSE(nn.Module):
 
 
 if __name__ == "__main__":
-    model = DeepLabV3PlusSCSE(in_channels=4, classes=1)
+    model = DeepLabV3PlusSCSE(in_channels=5, classes=1)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"{n_params:,} parameters")  # sanity check: should be well under
-                                         # the ~6M Zhang et al. report for
-                                         # the full MobileNetV2+scSE model
-    out = model(torch.zeros(2, 4, 256, 256))
-    print(out.shape)  # expect (2, 1, 256, 256)
+    print(f"{n_params:,} parameters")
+    # Test 5-band input (synopsis-compliant full_5band mode)
+    out = model(torch.zeros(2, 5, 256, 256))
+    print(out.shape)   # expect (2, 1, 256, 256)
+    # Test 2-band fallback
+    model_2b = DeepLabV3PlusSCSE(in_channels=2, classes=1)
+    out_2b = model_2b(torch.zeros(2, 2, 256, 256))
+    print(out_2b.shape)  # expect (2, 1, 256, 256)

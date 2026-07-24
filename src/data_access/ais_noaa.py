@@ -62,6 +62,59 @@ def to_geodataframe(df, src_crs="EPSG:4326"):
     return gpd.GeoDataFrame(df, geometry=geom, crs=src_crs)
 
 
+def pair_sar_to_ais(
+    csv_path: str,
+    scene_bbox: tuple[float, float, float, float],
+    scene_acquisition_time: str | "pd.Timestamp",
+    window_hours: float = 6.0,
+    bilge_relevant_only: bool = True,
+    chunksize: int = 500_000,
+) -> "gpd.GeoDataFrame":
+    """
+    AIS-SAR temporal pairing utility (synopsis Section 1.1: ±6 h window).
+
+    Automatically computes the ±window_hours time bracket around
+    scene_acquisition_time and calls load_ais_window, so the caller
+    never has to compute start/end times manually.
+
+    Parameters
+    ----------
+    csv_path               : path to the NOAA AIS monthly CSV file
+    scene_bbox             : (min_lon, min_lat, max_lon, max_lat) of the SAR scene
+    scene_acquisition_time : SAR acquisition time (UTC) — any pandas-parseable
+                             string or Timestamp, e.g. "2026-03-15T09:32:00Z"
+    window_hours           : half-width of the temporal window (default 6 h)
+    bilge_relevant_only    : if True, filter to cargo/tanker/fishing vessels only
+    chunksize              : rows per chunk for memory-efficient CSV reading
+
+    Returns
+    -------
+    GeoDataFrame of AIS position reports within the spatiotemporal window,
+    with point geometry in WGS84 (EPSG:4326).
+    """
+    acq_time   = pd.Timestamp(scene_acquisition_time, tz="UTC") \
+        if pd.Timestamp(scene_acquisition_time).tzinfo is None \
+        else pd.Timestamp(scene_acquisition_time)
+    delta      = pd.Timedelta(hours=window_hours)
+    start_time = acq_time - delta
+    end_time   = acq_time + delta
+
+    df = load_ais_window(
+        csv_path   = csv_path,
+        bbox       = scene_bbox,
+        start_time = start_time,
+        end_time   = end_time,
+        chunksize  = chunksize,
+    )
+
+    if bilge_relevant_only and not df.empty:
+        df = filter_to_bilge_relevant_types(df)
+
+    return to_geodataframe(df) if not df.empty else gpd.GeoDataFrame(columns=USECOLS)
+
+
+
+
 if __name__ == "__main__":
     df = load_ais_window(
         "AIS_2026_03_Zone15.csv",
