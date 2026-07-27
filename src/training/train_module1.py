@@ -69,124 +69,63 @@ from src.validation.metrics import compute_miou, compute_pixel_f1
 from src.reporting.module1_report import generate_module1_report
 
 
-# ─── Google Drive auto-uploader ──────────────────────────────────────────────────
+# ─── Hugging Face Hub auto-uploader ──────────────────────────────────────────────
 
-class GDriveUploader:
+class HfUploader:
     """
-    Silently uploads checkpoint / metrics files to Google Drive after every
-    best-epoch save. Designed for headless Kaggle Save & Run sessions where
-    no human intervention is possible.
+    Silently uploads checkpoint / metrics files to Hugging Face Hub after every
+    best-epoch save. Designed for headless Kaggle Save & Run sessions.
 
     If authentication fails or any upload errors, a warning is logged and
-    training continues uninterrupted — Drive upload is always best-effort.
+    training continues uninterrupted.
     """
 
-    def __init__(self, folder_id: str, credentials_path: str) -> None:
-        self.folder_id   = folder_id
-        self.enabled     = False
-        self._svc        = None
-        self._log        = logging.getLogger(self.__class__.__name__)
+    def __init__(self, repo_id: str, token: str) -> None:
+        self.repo_id = repo_id
+        self.enabled = False
+        self._api    = None
+        self._log    = logging.getLogger(self.__class__.__name__)
 
-        if not folder_id or not credentials_path:
-            self._log.info("GDriveUploader: disabled (no folder_id or credentials).")
+        if not repo_id or not token:
+            self._log.info("HfUploader: disabled (no repo_id or token).")
             return
 
         try:
-            import json as _json
-            from googleapiclient.discovery import build
-
-            with open(credentials_path) as _f:
-                _creds_data = _json.load(_f)
-
-            # ── Auto-detect credential type ──────────────────────────────────
-            # OAuth user credentials (refresh_token present) — works with
-            # personal Google Drive, uses your own storage quota.
-            # Service account — requires Shared Drive (Google Workspace only).
-            if "refresh_token" in _creds_data:
-                from google.oauth2.credentials import Credentials
-                from google.auth.transport.requests import Request
-                creds = Credentials.from_authorized_user_info(
-                    _creds_data,
-                    scopes=["https://www.googleapis.com/auth/drive"],
-                )
-                # Refresh the access token if it has expired
-                if creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                self._log.info(
-                    "☁️  Google Drive uploader ready (OAuth user credentials) "
-                    "— folder: %s", folder_id
-                )
-            elif _creds_data.get("type") == "service_account":
-                from google.oauth2 import service_account
-                creds = service_account.Credentials.from_service_account_info(
-                    _creds_data,
-                    scopes=["https://www.googleapis.com/auth/drive"],
-                )
-                self._log.info(
-                    "☁️  Google Drive uploader ready (service account) "
-                    "— folder: %s", folder_id
-                )
-            else:
-                raise ValueError(
-                    "Unrecognised credentials format. "
-                    "Expected OAuth user credentials (has 'refresh_token') "
-                    "or service account (has 'type': 'service_account')."
-                )
-
-            self._svc    = build("drive", "v3", credentials=creds, cache_discovery=False)
+            from huggingface_hub import HfApi
+            self._api = HfApi(token=token)
+            # Verify token and repo exist (or create repo)
+            self._api.create_repo(repo_id=repo_id, exist_ok=True, private=True)
             self.enabled = True
-
+            self._log.info("🤗 Hugging Face uploader ready — repo: %s", repo_id)
         except Exception as exc:
             self._log.warning(
-                "GDriveUploader: init failed (%s). Drive uploads disabled.", exc
+                "HfUploader: init failed (%s). HF uploads disabled.", exc
             )
 
     # ------------------------------------------------------------------ #
     def upload(self, local_path: str | Path, label: str = "") -> bool:
-        """
-        Upload *local_path* to the configured Drive folder.
-        If a file with the same name already exists, it is updated in-place
-        (share links are preserved). Returns True on success.
-        """
-        if not self.enabled or self._svc is None:
+        """Upload *local_path* to HF Hub. Returns True on success."""
+        if not self.enabled or self._api is None:
             return False
         try:
-            from googleapiclient.http import MediaFileUpload
             local_path = Path(local_path)
             name       = local_path.name
             size_mb    = local_path.stat().st_size / (1024 ** 2)
-            media      = MediaFileUpload(
-                str(local_path), mimetype="application/octet-stream", resumable=True
+
+            self._api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=name,
+                repo_id=self.repo_id,
+                commit_message=f"Auto-save {name} {label}".strip()
             )
-            # Check for existing file with same name
-            q        = f"name='{name}' and '{self.folder_id}' in parents and trashed=false"
-            existing = (
-                self._svc.files()
-                .list(q=q, fields="files(id,name)")
-                .execute()
-                .get("files", [])
-            )
-            if existing:
-                fid = existing[0]["id"]
-                self._svc.files().update(fileId=fid, media_body=media).execute()
-                tag = "🔄 updated"
-            else:
-                meta   = {"name": name, "parents": [self.folder_id]}
-                result = (
-                    self._svc.files()
-                    .create(body=meta, media_body=media, fields="id")
-                    .execute()
-                )
-                fid = result["id"]
-                tag = "☁️ uploaded"
 
             suffix = f"  [{label}]" if label else ""
             self._log.info(
-                "  ☁️ Drive %s: %s  (%.1f MB)%s", tag.split()[1], name, size_mb, suffix
+                "  🤗 HF Hub uploaded: %s  (%.1f MB)%s", name, size_mb, suffix
             )
             return True
         except Exception as exc:
-            self._log.warning("  Drive upload failed for %s: %s", local_path.name, exc)
+            self._log.warning("  HF upload failed for %s: %s", local_path.name, exc)
             return False
 
     # ------------------------------------------------------------------ #
@@ -385,10 +324,10 @@ def train(args: argparse.Namespace) -> None:
     scaler = (torch.cuda.amp.GradScaler()
               if device.type == "cuda" and args.use_amp else None)
 
-    # ── Google Drive uploader (headless auto-save for Save & Run sessions) ──
-    gdrive = GDriveUploader(
-        folder_id        = getattr(args, "gdrive_folder_id", "") or "",
-        credentials_path = getattr(args, "gdrive_credentials", "") or "",
+    # ── Hugging Face uploader (headless auto-save for Save & Run sessions) ──
+    hf_uploader = HfUploader(
+        repo_id = getattr(args, "hf_repo_id", "") or "",
+        token   = getattr(args, "hf_token", "") or "",
     )
 
     # ── Resume from checkpoint (multi-session support) ────────────────────
@@ -564,8 +503,8 @@ def train(args: argparse.Namespace) -> None:
             }, ckpt_dir / "best_model.pt")
             log.info("  ★ New best model saved (epoch=%d  val_loss=%.4f)",
                      epoch, best_val_loss)
-            # ── AUTO-UPLOAD best to Drive immediately after save ──
-            gdrive.upload(
+            # ── AUTO-UPLOAD best to HF immediately after save ──
+            hf_uploader.upload(
                 ckpt_dir / "best_model.pt",
                 label=f"epoch={epoch} val_loss={best_val_loss:.4f}",
             )
@@ -580,8 +519,8 @@ def train(args: argparse.Namespace) -> None:
                 "val_loss"    : best_val_loss,
             }, ckpt_dir / "last_model.pt")
             log.info("  💾 last_model.pt saved at epoch %d", epoch)
-            # ── AUTO-UPLOAD last + metrics CSV to Drive every 5 epochs ──
-            gdrive.upload_many(
+            # ── AUTO-UPLOAD last + metrics CSV to HF every 5 epochs ──
+            hf_uploader.upload_many(
                 [
                     ckpt_dir / "last_model.pt",
                     metrics_dir / "train_metrics.csv",
@@ -685,24 +624,21 @@ def _parse_args() -> argparse.Namespace:
         help="Skip pseudo-labelling when resuming mid-training (use on intermediate sessions).",
     )
     p.add_argument(
-        "--gdrive-folder-id",
+        "--hf-repo-id",
         default="",
-        metavar="FOLDER_ID",
+        metavar="REPO_ID",
         help=(
-            "Google Drive folder ID for automatic checkpoint uploads. "
-            "After every best_model.pt save and every 5 epochs, files are "
-            "silently uploaded to Drive. Training continues even if upload fails. "
-            "Get the ID from the folder URL: drive.google.com/drive/folders/<ID>"
+            "Hugging Face dataset repo ID (e.g., 'username/oil-spill-checkpoints') "
+            "for automatic checkpoint uploads."
         ),
     )
     p.add_argument(
-        "--gdrive-credentials",
+        "--hf-token",
         default="",
-        metavar="JSON_PATH",
+        metavar="TOKEN",
         help=(
-            "Path to a Google service account JSON credentials file. "
-            "Write this file in the notebook from Kaggle Secrets before training. "
-            "Example: /kaggle/working/gdrive_sa.json"
+            "Hugging Face write access token. "
+            "Usually fetched from Kaggle Secrets."
         ),
     )
     args = p.parse_args()

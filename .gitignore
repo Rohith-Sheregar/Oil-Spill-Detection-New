@@ -15,8 +15,3 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 
-# Google Drive OAuth credentials — NEVER commit these
-client_secrets.json
-gdrive_oauth_creds.json
-*.gdrive_sa.json
-/kaggle/working/gdrive_sa.json
