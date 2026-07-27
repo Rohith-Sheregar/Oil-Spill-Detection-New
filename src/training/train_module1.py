@@ -92,17 +92,50 @@ class GDriveUploader:
             return
 
         try:
-            from google.oauth2 import service_account
+            import json as _json
             from googleapiclient.discovery import build
-            creds = service_account.Credentials.from_service_account_file(
-                credentials_path,
-                scopes=["https://www.googleapis.com/auth/drive"],
-            )
-            self._svc   = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+            with open(credentials_path) as _f:
+                _creds_data = _json.load(_f)
+
+            # ── Auto-detect credential type ──────────────────────────────────
+            # OAuth user credentials (refresh_token present) — works with
+            # personal Google Drive, uses your own storage quota.
+            # Service account — requires Shared Drive (Google Workspace only).
+            if "refresh_token" in _creds_data:
+                from google.oauth2.credentials import Credentials
+                from google.auth.transport.requests import Request
+                creds = Credentials.from_authorized_user_info(
+                    _creds_data,
+                    scopes=["https://www.googleapis.com/auth/drive"],
+                )
+                # Refresh the access token if it has expired
+                if creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                self._log.info(
+                    "☁️  Google Drive uploader ready (OAuth user credentials) "
+                    "— folder: %s", folder_id
+                )
+            elif _creds_data.get("type") == "service_account":
+                from google.oauth2 import service_account
+                creds = service_account.Credentials.from_service_account_info(
+                    _creds_data,
+                    scopes=["https://www.googleapis.com/auth/drive"],
+                )
+                self._log.info(
+                    "☁️  Google Drive uploader ready (service account) "
+                    "— folder: %s", folder_id
+                )
+            else:
+                raise ValueError(
+                    "Unrecognised credentials format. "
+                    "Expected OAuth user credentials (has 'refresh_token') "
+                    "or service account (has 'type': 'service_account')."
+                )
+
+            self._svc    = build("drive", "v3", credentials=creds, cache_discovery=False)
             self.enabled = True
-            self._log.info(
-                "☁️  Google Drive uploader ready — folder: %s", folder_id
-            )
+
         except Exception as exc:
             self._log.warning(
                 "GDriveUploader: init failed (%s). Drive uploads disabled.", exc
