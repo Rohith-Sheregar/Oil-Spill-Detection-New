@@ -27,6 +27,13 @@ Arguments:
                     and starts from (saved_epoch + 1). Use this to continue
                     training across multiple Kaggle sessions.
                     Example: --resume /kaggle/input/oil-spill-checkpoints/last_model.pt
+    --gdrive-folder-id   Google Drive folder ID to auto-upload checkpoints.
+                    Upload happens after every best_model.pt save and every 5 epochs.
+                    Get the ID from the Drive folder URL:
+                    https://drive.google.com/drive/folders/<THIS_PART>
+    --gdrive-credentials Path to service account JSON file for Drive authentication.
+                    Write credentials to this file from Kaggle Secrets in Cell 1.
+                    Example: --gdrive-credentials /kaggle/working/gdrive_sa.json
 """
 from __future__ import annotations
 
@@ -60,6 +67,101 @@ from src.training.splits import scene_level_split
 from src.training.gpu_utils import probe_max_batch_size
 from src.validation.metrics import compute_miou, compute_pixel_f1
 from src.reporting.module1_report import generate_module1_report
+
+
+# ─── Google Drive auto-uploader ──────────────────────────────────────────────────
+
+class GDriveUploader:
+    """
+    Silently uploads checkpoint / metrics files to Google Drive after every
+    best-epoch save. Designed for headless Kaggle Save & Run sessions where
+    no human intervention is possible.
+
+    If authentication fails or any upload errors, a warning is logged and
+    training continues uninterrupted — Drive upload is always best-effort.
+    """
+
+    def __init__(self, folder_id: str, credentials_path: str) -> None:
+        self.folder_id   = folder_id
+        self.enabled     = False
+        self._svc        = None
+        self._log        = logging.getLogger(self.__class__.__name__)
+
+        if not folder_id or not credentials_path:
+            self._log.info("GDriveUploader: disabled (no folder_id or credentials).")
+            return
+
+        try:
+            from google.oauth2 import service_account
+            from googleapiclient.discovery import build
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_path,
+                scopes=["https://www.googleapis.com/auth/drive"],
+            )
+            self._svc   = build("drive", "v3", credentials=creds, cache_discovery=False)
+            self.enabled = True
+            self._log.info(
+                "☁️  Google Drive uploader ready — folder: %s", folder_id
+            )
+        except Exception as exc:
+            self._log.warning(
+                "GDriveUploader: init failed (%s). Drive uploads disabled.", exc
+            )
+
+    # ------------------------------------------------------------------ #
+    def upload(self, local_path: str | Path, label: str = "") -> bool:
+        """
+        Upload *local_path* to the configured Drive folder.
+        If a file with the same name already exists, it is updated in-place
+        (share links are preserved). Returns True on success.
+        """
+        if not self.enabled or self._svc is None:
+            return False
+        try:
+            from googleapiclient.http import MediaFileUpload
+            local_path = Path(local_path)
+            name       = local_path.name
+            size_mb    = local_path.stat().st_size / (1024 ** 2)
+            media      = MediaFileUpload(
+                str(local_path), mimetype="application/octet-stream", resumable=True
+            )
+            # Check for existing file with same name
+            q        = f"name='{name}' and '{self.folder_id}' in parents and trashed=false"
+            existing = (
+                self._svc.files()
+                .list(q=q, fields="files(id,name)")
+                .execute()
+                .get("files", [])
+            )
+            if existing:
+                fid = existing[0]["id"]
+                self._svc.files().update(fileId=fid, media_body=media).execute()
+                tag = "🔄 updated"
+            else:
+                meta   = {"name": name, "parents": [self.folder_id]}
+                result = (
+                    self._svc.files()
+                    .create(body=meta, media_body=media, fields="id")
+                    .execute()
+                )
+                fid = result["id"]
+                tag = "☁️ uploaded"
+
+            suffix = f"  [{label}]" if label else ""
+            self._log.info(
+                "  ☁️ Drive %s: %s  (%.1f MB)%s", tag.split()[1], name, size_mb, suffix
+            )
+            return True
+        except Exception as exc:
+            self._log.warning("  Drive upload failed for %s: %s", local_path.name, exc)
+            return False
+
+    # ------------------------------------------------------------------ #
+    def upload_many(self, paths: list, label: str = "") -> None:
+        """Upload a list of files; continue even if individual uploads fail."""
+        for p in paths:
+            if Path(p).exists():
+                self.upload(p, label=label)
 
 
 # ─── Logging setup ───────────────────────────────────────────────────────────
@@ -250,6 +352,12 @@ def train(args: argparse.Namespace) -> None:
     scaler = (torch.cuda.amp.GradScaler()
               if device.type == "cuda" and args.use_amp else None)
 
+    # ── Google Drive uploader (headless auto-save for Save & Run sessions) ──
+    gdrive = GDriveUploader(
+        folder_id        = getattr(args, "gdrive_folder_id", "") or "",
+        credentials_path = getattr(args, "gdrive_credentials", "") or "",
+    )
+
     # ── Resume from checkpoint (multi-session support) ────────────────────
     start_epoch   = 1
     best_val_loss = float("inf")
@@ -416,13 +524,18 @@ def train(args: argparse.Namespace) -> None:
                 "epoch"       : epoch,
                 "model_state" : model.state_dict(),
                 "optimizer"   : optimizer.state_dict(),
-                "scheduler"   : scheduler.state_dict(),   # ← included for full resume
+                "scheduler"   : scheduler.state_dict(),
                 "val_loss"    : best_val_loss,
                 "val_miou"    : val_metrics["val_miou"],
                 "config"      : run_config,
             }, ckpt_dir / "best_model.pt")
             log.info("  ★ New best model saved (epoch=%d  val_loss=%.4f)",
                      epoch, best_val_loss)
+            # ── AUTO-UPLOAD best to Drive immediately after save ──
+            gdrive.upload(
+                ckpt_dir / "best_model.pt",
+                label=f"epoch={epoch} val_loss={best_val_loss:.4f}",
+            )
 
         # Save last checkpoint every 5 epochs (always resumable)
         if epoch % 5 == 0 or epoch == end_epoch:
@@ -431,9 +544,17 @@ def train(args: argparse.Namespace) -> None:
                 "model_state" : model.state_dict(),
                 "optimizer"   : optimizer.state_dict(),
                 "scheduler"   : scheduler.state_dict(),
-                "val_loss"    : best_val_loss,             # ← track for resume
+                "val_loss"    : best_val_loss,
             }, ckpt_dir / "last_model.pt")
             log.info("  💾 last_model.pt saved at epoch %d", epoch)
+            # ── AUTO-UPLOAD last + metrics CSV to Drive every 5 epochs ──
+            gdrive.upload_many(
+                [
+                    ckpt_dir / "last_model.pt",
+                    metrics_dir / "train_metrics.csv",
+                ],
+                label=f"epoch={epoch}",
+            )
 
     csv_file.close()
     log.info("Training complete. Best val_loss=%.4f", best_val_loss)
@@ -529,6 +650,27 @@ def _parse_args() -> argparse.Namespace:
         "--skip-pseudo-on-resume",
         action="store_true",
         help="Skip pseudo-labelling when resuming mid-training (use on intermediate sessions).",
+    )
+    p.add_argument(
+        "--gdrive-folder-id",
+        default="",
+        metavar="FOLDER_ID",
+        help=(
+            "Google Drive folder ID for automatic checkpoint uploads. "
+            "After every best_model.pt save and every 5 epochs, files are "
+            "silently uploaded to Drive. Training continues even if upload fails. "
+            "Get the ID from the folder URL: drive.google.com/drive/folders/<ID>"
+        ),
+    )
+    p.add_argument(
+        "--gdrive-credentials",
+        default="",
+        metavar="JSON_PATH",
+        help=(
+            "Path to a Google service account JSON credentials file. "
+            "Write this file in the notebook from Kaggle Secrets before training. "
+            "Example: /kaggle/working/gdrive_sa.json"
+        ),
     )
     args = p.parse_args()
     args.use_amp = not args.no_amp
