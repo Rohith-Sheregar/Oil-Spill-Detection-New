@@ -14,7 +14,7 @@ Arguments:
                     Default: results/module1/
     --input-mode    Band mode: vv_vh | vv_vh_diff | vv_vh_h_alpha | full_5band
                     Default: full_5band
-    --epochs        Total training epochs. Default: 50
+    --epochs        Total training epochs to run in THIS session. Default: 50
     --patch-size    Crop size for patches. Default: 256
     --batch-size    Override auto-probed batch size. Default: auto
     --lr            Initial learning rate. Default: 1e-3
@@ -22,6 +22,11 @@ Arguments:
     --pseudo-cycles Max pseudo-label cycles. Default: 5 (resource-friendly on-device default)
     --num-workers   DataLoader workers. Default: 2
     --seed          Random seed. Default: 42
+    --resume        Path to a checkpoint (.pt) to resume training from.
+                    Restores model weights, optimizer, scheduler, best_val_loss,
+                    and starts from (saved_epoch + 1). Use this to continue
+                    training across multiple Kaggle sessions.
+                    Example: --resume /kaggle/input/oil-spill-checkpoints/last_model.pt
 """
 from __future__ import annotations
 
@@ -204,6 +209,11 @@ def train(args: argparse.Namespace) -> None:
         log.info("GPU: %s  VRAM: %.1f GB",
                  torch.cuda.get_device_name(0),
                  torch.cuda.get_device_properties(0).total_memory / 1024**3)
+    else:
+        log.warning(
+            "⚠️  No CUDA GPU detected — training on CPU will be very slow!\n"
+            "    On Kaggle: Settings → Accelerator → GPU T4 x1, then restart."
+        )
 
     # ── Build datasets ────────────────────────────────────────────────────
     train_df, val_df, unlabelled_df, metadata = _build_dataframes(data_root, args.seed)
@@ -240,6 +250,32 @@ def train(args: argparse.Namespace) -> None:
     scaler = (torch.cuda.amp.GradScaler()
               if device.type == "cuda" and args.use_amp else None)
 
+    # ── Resume from checkpoint (multi-session support) ────────────────────
+    start_epoch   = 1
+    best_val_loss = float("inf")
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            log.error("--resume path not found: %s", resume_path)
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        log.info("▶ Resuming from checkpoint: %s", resume_path)
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "val_loss" in ckpt:
+            best_val_loss = ckpt["val_loss"]
+        resumed_epoch = ckpt.get("epoch", 0)
+        start_epoch   = resumed_epoch + 1
+        log.info(
+            "  Resumed: epoch=%d  best_val_loss=%.4f  "
+            "will train epochs %d → %d",
+            resumed_epoch, best_val_loss,
+            start_epoch, start_epoch + args.epochs - 1,
+        )
+
     # Probe batch size
     if args.batch_size:
         batch_size = args.batch_size
@@ -270,20 +306,24 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Metrics CSV setup ─────────────────────────────────────────────────
     csv_path = metrics_dir / "train_metrics.csv"
-    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_mode = "a" if (args.resume and csv_path.exists()) else "w"
+    csv_file = open(csv_path, csv_mode, newline="", encoding="utf-8")
     csv_writer = csv.DictWriter(
         csv_file,
         fieldnames=["epoch", "train_loss", "val_loss", "val_miou", "val_f1",
                     "val_precision", "val_recall", "lr", "epoch_s"],
     )
-    csv_writer.writeheader()
+    if csv_mode == "w":  # only write header for new files
+        csv_writer.writeheader()
 
     # ── Training loop ─────────────────────────────────────────────────────
     history = {"train_loss": [], "val_loss": [], "val_miou": [], "val_f1": [], "lr": []}
-    best_val_loss = float("inf")
+    # NOTE: best_val_loss and start_epoch are set above (either fresh or from --resume)
     samples_for_report = []
 
-    for epoch in range(1, args.epochs + 1):
+    end_epoch = start_epoch + args.epochs - 1
+    log.info("Training epochs %d → %d", start_epoch, end_epoch)
+    for epoch in range(start_epoch, end_epoch + 1):
         t0 = time.time()
         model.train()
         epoch_loss = 0.0
@@ -320,7 +360,7 @@ def train(args: argparse.Namespace) -> None:
         log.info(
             "Epoch %3d/%d  train_loss=%.4f  val_loss=%.4f  "
             "mIoU=%.4f  F1=%.4f  lr=%.2e  t=%.1fs",
-            epoch, args.epochs,
+            epoch, end_epoch,
             avg_train_loss, val_metrics["val_loss"],
             val_metrics["val_miou"], val_metrics["val_f1"],
             current_lr, epoch_s,
@@ -353,7 +393,7 @@ def train(args: argparse.Namespace) -> None:
         csv_file.flush()
 
         # Collect sample predictions for report (first epoch only)
-        if epoch == 1 and not samples_for_report:
+        if epoch == start_epoch and not samples_for_report:
             model.eval()
             with torch.no_grad():
                 sample_batch = next(iter(val_loader))
@@ -376,20 +416,24 @@ def train(args: argparse.Namespace) -> None:
                 "epoch"       : epoch,
                 "model_state" : model.state_dict(),
                 "optimizer"   : optimizer.state_dict(),
+                "scheduler"   : scheduler.state_dict(),   # ← included for full resume
                 "val_loss"    : best_val_loss,
                 "val_miou"    : val_metrics["val_miou"],
                 "config"      : run_config,
             }, ckpt_dir / "best_model.pt")
-            log.info("  -> New best model saved (val_loss=%.4f)", best_val_loss)
+            log.info("  ★ New best model saved (epoch=%d  val_loss=%.4f)",
+                     epoch, best_val_loss)
 
-        # Save last checkpoint every 5 epochs
-        if epoch % 5 == 0 or epoch == args.epochs:
+        # Save last checkpoint every 5 epochs (always resumable)
+        if epoch % 5 == 0 or epoch == end_epoch:
             torch.save({
                 "epoch"       : epoch,
                 "model_state" : model.state_dict(),
                 "optimizer"   : optimizer.state_dict(),
                 "scheduler"   : scheduler.state_dict(),
+                "val_loss"    : best_val_loss,             # ← track for resume
             }, ckpt_dir / "last_model.pt")
+            log.info("  💾 last_model.pt saved at epoch %d", epoch)
 
     csv_file.close()
     log.info("Training complete. Best val_loss=%.4f", best_val_loss)
@@ -403,7 +447,7 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Pseudo-labelling ──────────────────────────────────────────────────
     pseudo_history = None
-    if not args.no_pseudo and len(unlabelled_df) > 0:
+    if not args.no_pseudo and len(unlabelled_df) > 0 and not args.skip_pseudo_on_resume:
         log.info("Starting pseudo-label self-evolution (%d cycles)...", args.pseudo_cycles)
         # Load best checkpoint before pseudo-labelling
         best_ckpt = torch.load(ckpt_dir / "best_model.pt", map_location=device)
@@ -469,6 +513,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed",             type=int,   default=42)
     p.add_argument("--no-amp",           action="store_true",
                    help="Disable automatic mixed precision")
+    p.add_argument(
+        "--resume",
+        default=None,
+        metavar="CHECKPOINT",
+        help=(
+            "Path to a .pt checkpoint to resume training from. "
+            "Restores model, optimizer, scheduler, and best_val_loss. "
+            "Training continues from (checkpoint_epoch + 1). "
+            "Use 'last_model.pt' to continue a session, or "
+            "'best_model.pt' to fine-tune from the best weights."
+        ),
+    )
+    p.add_argument(
+        "--skip-pseudo-on-resume",
+        action="store_true",
+        help="Skip pseudo-labelling when resuming mid-training (use on intermediate sessions).",
+    )
     args = p.parse_args()
     args.use_amp = not args.no_amp
     return args
