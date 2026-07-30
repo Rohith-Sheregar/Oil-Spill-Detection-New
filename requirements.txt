@@ -12,6 +12,8 @@ opencv-python-headless
 tifffile
 tqdm
 py7zr
+joblib          # RF serialization (Module 2)
+matplotlib      # Feature importance plot (Module 2)
 
 # Segmentation model on top of whatever torch+cuda Colab/Kaggle already ships --
 # do NOT `pip install torch` blindly here; check torch.cuda.is_available() first.
