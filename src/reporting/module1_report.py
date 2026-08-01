@@ -396,7 +396,7 @@ def build_html_report(
           <ul style="line-height:1.8;padding-left:20px">
             <li><b>Bands 0-1 (VV, VH):</b> Sigma0 calibrated backscatter in dB, robust-percentile normalised to [0,1].</li>
             <li><b>Band 2 (Entropy H):</b> Dual-pol Cloude-Pottier Shannon entropy. H≈0 = single dominant scattering mechanism (specular/calm sea); H≈1 = depolarising medium (ocean roughness, oil trapping).</li>
-            <li><b>Band 3 (Alpha angle):</b> Mean scattering mechanism angle. α&lt;45° = surface scattering (Bragg resonance); α&gt;45° = volume/double-bounce (oil layer multipaths).</li>
+            <li><b>Band 3 (RVI_dp):</b> Dual-pol Radar Vegetation Index, 4·VH/(VV+VH). Substitutes the synopsis's Cloude-Pottier alpha angle, which requires complex SLC phase unavailable in Sentinel-1 GRD amplitude products. Low values indicate depolarisation-suppressed, smooth (potentially oil-dampened) surfaces; higher values indicate rougher, more depolarising ocean backscatter.</li>
             <li><b>Band 4 (Wind-corrected ratio):</b> Raw VV/VH ratio divided by the CMOD5.N prediction for the scene wind speed. Removes wind-driven backscatter variation so oil signature is wind-invariant.</li>
             <li><b>scSE attention:</b> Channel squeeze-and-excitation + spatial squeeze-and-excitation applied to the decoder output. Focuses the network on dark oil patches against bright sea clutter.</li>
             <li><b>Loss:</b> BCE(ε=0.1) + Dice(smooth=1). Label smoothing prevents overconfident predictions on ambiguous oil boundaries. Dice handles severe class imbalance (&lt;1% positive pixels per scene).</li>

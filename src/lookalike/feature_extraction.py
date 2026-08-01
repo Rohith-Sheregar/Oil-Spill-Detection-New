@@ -50,7 +50,7 @@ import pandas as pd
 
 
 def extract_patch_features(
-    mask, vv, vh, H, alpha, wind_speed, hour_local, scene_id
+    mask, vv, vh, H, rvi_dp, wind_speed, hour_local, scene_id
 ) -> pd.DataFrame:
     """
     [DEPRECATED] Legacy wrapper around features.extract_scene_features().
@@ -68,7 +68,7 @@ def extract_patch_features(
     from src.lookalike.morphology import close_and_extract
     _, regions = close_and_extract(mask)
 
-    # Convert legacy (H, alpha_deg_raw) — alpha here is already in degrees
+    # Convert legacy call — rvi_dp is ignored since extraction handles it internally
     return extract_scene_features(
         regions       = regions,
         vv_db         = vv,

@@ -7,10 +7,21 @@ project synopsis:
 
     Category        Features (4 each)
     ─────────────── ──────────────────────────────────────────────────
-    Polarimetric    mean_H, anisotropy_A, mean_alpha_deg, copol_ratio_VV_VH
+    Polarimetric    mean_H, anisotropy_A, mean_rvi_dp, copol_ratio_VV_VH
     Geometric       area_km2, elongation, perimeter_area_ratio, compactness
     Contextual      wind_speed_ms, proximity_shipping_lane_km, is_night
     Temporal        morphology_change_km2
+
+IMPORTANT — RVI_dp instead of Alpha
+-----------------------------------
+The synopsis specifies Cloude-Pottier alpha (α) angle. However, α requires
+the eigenvectors of the coherency matrix, which in turn require complex phase
+information. Sentinel-1 GRD products are phase-discarded amplitude products
+(phase is destroyed during SNAP's detection step regardless of polarization).
+Thus, alpha is uncomputable from this dataset. In its place, we use the
+dual-pol Radar Vegetation Index (RVI_dp = 4*VH/(VV+VH)), a phase-free
+descriptor used for dual-pol surface discrimination, applied here as a proxy
+for surface-roughness/depolarization contrast around oil slicks.
 
 IMPORTANT — Anisotropy A degenerate case
 -----------------------------------------
@@ -41,7 +52,7 @@ import pandas as pd
 
 from src.preprocessing.polsar_decomp import (
     db_to_linear,
-    dual_pol_entropy_alpha,
+    dual_pol_entropy_rvi,
     compute_anisotropy_placeholder,
 )
 from src.data_access.sentinel1_cdse import SHIPPING_LANE_BBOXES
@@ -172,7 +183,7 @@ def _extract_region_features(
     vv_db: np.ndarray,              # (H, W) float32, Sigma0 VV in dB
     vh_db: np.ndarray,              # (H, W) float32, Sigma0 VH in dB
     H_map: np.ndarray,              # (H, W) float32, Entropy H in [0, 1]
-    alpha_map_deg: np.ndarray,      # (H, W) float32, Alpha angle in degrees [0°, 90°]
+    rvi_dp_map: np.ndarray,         # (H, W) float32, dual-pol Radar Vegetation Index (RVI_dp), unnormalised >= 0. Substitutes Cloude-Pottier alpha, which is uncomputable from phase-discarded Sentinel-1 GRD amplitude data (see module docstring).
     gsd_m: float,                   # Ground sampling distance in metres (10.0 for S1 IW GRD)
     wind_speed_ms: float,           # ERA5 U10, m/s
     proximity_km: float,            # Pre-computed shipping-lane proximity
@@ -193,9 +204,9 @@ def _extract_region_features(
     region          : skimage.measure.RegionProperties instance
     vv_db, vh_db    : full-scene dB arrays (NOT patch-cropped); indexing via
                       region.coords for per-pixel values inside the component
-    H_map, alpha_map_deg : full-scene polsar decomp arrays (linear-scale H,
-                      degrees alpha). These are pre-computed once per scene for
-                      efficiency and passed in.
+    H_map, rvi_dp_map : full-scene polsar decomp arrays (linear-scale H,
+                      unnormalised RVI_dp). These are pre-computed once per scene
+                      for efficiency and passed in.
     gsd_m           : GSD in metres (10.0 default for Sentinel-1 IW GRD 10m)
     wind_speed_ms   : Scene-level ERA5 wind speed (scalar). Per-patch centroid
                       ERA5 would be more accurate but requires ERA5 spatial query;
@@ -220,7 +231,7 @@ def _extract_region_features(
 
     mean_H            = float(H_map[ys, xs].mean())
     anisotropy_A      = 0.0          # Degenerate: dual-pol, see module docstring
-    mean_rvi_dp       = float(alpha_map_deg[ys, xs].mean())
+    mean_rvi_dp       = float(rvi_dp_map[ys, xs].mean())
     copol_ratio_VV_VH = float(vv_lin_vals.mean() / max(vh_lin_vals.mean(), 1e-9))
 
     # ── Geometric features (Yang et al. 2022) ───────────────────────────────
@@ -332,10 +343,12 @@ def extract_scene_features(
     vh_db_arr = np.asarray(vh_db, dtype=np.float32)
     vv_lin    = np.power(10.0, np.maximum(vv_db_arr, -50.0) / 10.0)
     vh_lin    = np.power(10.0, np.maximum(vh_db_arr, -50.0) / 10.0)
-    H_map, alpha_map_deg = dual_pol_entropy_alpha(vv_lin, vh_lin)
-    # alpha from dual_pol_entropy_alpha is already in [0°, 90°] (NOT normalised)
-    # This is correct — do NOT divide by 90 here. band_stack.py normalises it
-    # to [0,1] for the CNN; we want the physical degrees for the RF features.
+    H_map, rvi_dp_map = dual_pol_entropy_rvi(vv_lin, vh_lin)
+    # rvi_dp_map is RAW RVI_dp (not the /2.0-clipped [0,1] version used for
+    # Band 3 of the CNN input in band_stack.py / zenodo_sos_dataset.py).
+    # RVI_dp replaces alpha here because alpha requires complex SLC phase
+    # that Sentinel-1 GRD amplitude products do not retain (see module
+    # docstring). Raw scale is kept for RF feature-importance interpretability.
 
     rows = []
     for region in regions:
@@ -368,7 +381,7 @@ def extract_scene_features(
             vv_db               = vv_db_arr,
             vh_db               = vh_db_arr,
             H_map               = H_map,
-            alpha_map_deg       = alpha_map_deg,
+            rvi_dp_map          = rvi_dp_map,
             gsd_m               = gsd_m,
             wind_speed_ms       = wind_speed_ms,
             proximity_km        = proximity_km,

@@ -41,7 +41,11 @@ class DeepLabV3PlusSCSE(nn.Module):
         Band 0: VV Sigma0 dB (normalised)
         Band 1: VH Sigma0 dB (normalised)
         Band 2: Cloude-Pottier Entropy H [0, 1]
-        Band 3: Cloude-Pottier Alpha angle / 90 [0, 1]
+        Band 3: Dual-pol Radar Vegetation Index (RVI_dp), normalised to [0,1]
+                via clip(RVI_dp/2.0, 0, 1). Substitutes Cloude-Pottier alpha, which is
+                uncomputable from phase-discarded Sentinel-1 GRD amplitude data (alpha
+                requires complex SLC phase for the coherency-matrix eigenvectors; GRD
+                detection destroys phase regardless of dual-pol vs quad-pol).
         Band 4: CMOD5.N wind-corrected VV/VH ratio [0, 1]
         Pass in_channels=4 for the vv_vh_h_alpha mode or in_channels=2/3
         for the 2/3-band fallback modes defined in zenodo_sos_dataset.py.
