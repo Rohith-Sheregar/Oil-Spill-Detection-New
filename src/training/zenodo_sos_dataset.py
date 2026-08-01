@@ -317,8 +317,8 @@ def read_image_channels(
             wind_dir_deg=wind_dir_deg,
         )
 
-        # ── Stack: [VV_norm, VH_norm, H, alpha_norm, wind_ratio] ──────────
-        return np.stack([vv_norm, vh_norm, band_H, band_a, band_w], axis=0)
+        # ── Stack: [VV_norm, VH_norm, H, RVI_dp_norm, wind_ratio] ─────────
+        return np.stack([vv_norm, vh_norm, band_H, band_rvi, band_w], axis=0)
 
     raise ValueError(f"Unsupported input_mode={input_mode!r}")
 
