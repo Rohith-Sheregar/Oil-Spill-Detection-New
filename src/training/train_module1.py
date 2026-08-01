@@ -227,10 +227,14 @@ def _validate(model, loader, criterion, device):
     cm = np.zeros((2, 2), dtype=np.int64)
 
     for batch in loader:
-        images = batch["image"].to(device)
-        masks  = batch["mask"].to(device)
-        logits = model(images)
-        loss   = criterion(logits, masks)
+        images = batch["image"].to(device).contiguous()
+        masks  = batch["mask"].to(device).contiguous()
+        
+        # Use autocast to match training precision and prevent cuDNN crashes on DataParallel
+        with torch.amp.autocast('cuda', enabled=device.type == "cuda"):
+            logits = model(images)
+            loss   = criterion(logits, masks)
+            
         total_loss += loss.item()
 
         probs    = torch.sigmoid(logits).squeeze(1).cpu().numpy()
@@ -321,7 +325,7 @@ def train(args: argparse.Namespace) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2
     )
-    scaler = (torch.cuda.amp.GradScaler()
+    scaler = (torch.amp.GradScaler('cuda')
               if device.type == "cuda" and args.use_amp else None)
 
     # ── Hugging Face uploader (headless auto-save for Save & Run sessions) ──
@@ -410,13 +414,12 @@ def train(args: argparse.Namespace) -> None:
         step_lr = []
 
         for batch in train_loader:
-            images = batch["image"].to(device)
-            masks  = batch["mask"].to(device)
+            images = batch["image"].to(device).contiguous()
+            masks  = batch["mask"].to(device).contiguous()
             optimizer.zero_grad()
 
             if scaler is not None:
-                from torch.cuda.amp import autocast
-                with autocast():
+                with torch.amp.autocast('cuda'):
                     logits = model(images)
                     loss   = criterion(logits, masks)
                 scaler.scale(loss).backward()
