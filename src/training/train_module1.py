@@ -370,10 +370,10 @@ def train(args: argparse.Namespace) -> None:
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=device.type == "cuda",
-                              persistent_workers=args.num_workers > 0)
+                              persistent_workers=args.num_workers > 0, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=max(1, batch_size // 2),
                               shuffle=False, num_workers=args.num_workers,
-                              pin_memory=device.type == "cuda")
+                              pin_memory=device.type == "cuda", drop_last=True)
 
     # ── Save run config ───────────────────────────────────────────────────
     run_config = {**vars(args), **metadata,
