@@ -120,13 +120,17 @@ class HfUploader:
         try:
             local_path = Path(local_path)
             size_mb    = local_path.stat().st_size / (1024 ** 2)
+            # Store all Module 2 artefacts under a module2/ subfolder so they
+            # don't collide with Module 1's best_model.pt / last_model.pt at
+            # the repo root.
+            repo_path  = f"module2/{local_path.name}"
             self._api.upload_file(
                 path_or_fileobj = str(local_path),
-                path_in_repo    = local_path.name,
+                path_in_repo    = repo_path,
                 repo_id         = self.repo_id,
                 commit_message  = f"Module2 auto-save {local_path.name} {label}".strip(),
             )
-            self._log.info("  🤗 HF uploaded: %s  (%.1f MB)", local_path.name, size_mb)
+            self._log.info("  🤗 HF uploaded: %s  (%.1f MB)", repo_path, size_mb)
             return True
         except Exception as exc:
             self._log.warning("  HF upload failed for %s: %s", local_path.name, exc)
@@ -241,90 +245,130 @@ def _load_mask(mask_path: str | Path | None) -> np.ndarray | None:
         return None
 
 
-def _build_scene_dicts(
+def _extract_features_streaming(
     df_pairs: pd.DataFrame,
     m1_checkpoint: str | Path | None,
     args: argparse.Namespace,
     device: Any,
     label_value: int,
-) -> list[dict]:
+    checkpoint_path: Path | None = None,
+    checkpoint_every: int = 100,
+) -> pd.DataFrame:
     """
-    Build a list of scene_dicts ready for build_feature_dataframe().
+    Memory-efficient feature extraction — processes ONE scene at a time.
 
-    For each row in df_pairs (one scene = one image_path + mask_path):
-      1. Load VV, VH dB arrays from TIFF
-      2. Load binary mask from mask_path OR run M1 inference
-      3. Apply morphological closing + extract components
-      4. Assemble scene_dict
+    Unlike the old _build_scene_dicts approach, this function:
+      - Loads VV/VH arrays for ONE scene
+      - Immediately extracts features (DataFrame rows)
+      - Discards the raw arrays (GC-able after each iteration)
+      - Checkpoints partial results every `checkpoint_every` scenes
+
+    This prevents the ~16 MB × N_scenes RAM accumulation that caused OOM
+    when N_scenes ≈ 550+ on Kaggle's 13–19 GB RAM limit.
 
     Parameters
     ----------
-    df_pairs      : DataFrame from discover_sos_pairs()
-    m1_checkpoint : path to Module 1 .pt checkpoint (used if mask_path missing)
-    args          : parsed CLI args (gsd_m, min_component_px, etc.)
-    device        : torch device for M1 inference
-    label_value   : ground-truth label for all components in this split (1=oil, 0=lookalike)
+    df_pairs          : DataFrame from discover_sos_pairs()
+    m1_checkpoint     : path to Module 1 .pt checkpoint (fallback if no GT mask)
+    args              : parsed CLI args (gsd_m, min_component_px, etc.)
+    device            : torch device for M1 inference
+    label_value       : ground-truth label for all components (1=oil, 0=lookalike)
+    checkpoint_path   : if set, partial DataFrames are saved here periodically
+    checkpoint_every  : save checkpoint after this many scenes
 
     Returns
     -------
-    list of scene_dicts
+    pd.DataFrame  with all extracted features (one row per connected component)
     """
-    scene_dicts = []
-    n_scenes = len(df_pairs)
-    log.info("Building scene dicts for %d scenes (label=%d)...", n_scenes, label_value)
+    import gc
+    n_scenes  = len(df_pairs)
+    cls_name  = "oil" if label_value == 1 else "lookalike"
+    log.info("Streaming feature extraction for %d '%s' scenes (label=%d)...",
+             n_scenes, cls_name, label_value)
 
-    for i, row in df_pairs.iterrows():
+    partial_dfs: list[pd.DataFrame] = []
+    n_good = 0
+
+    for idx, (_, row) in enumerate(df_pairs.iterrows()):
         scene_id   = row["scene_id"]
         image_path = row["image_path"]
         mask_path  = row.get("mask_path", None)
 
-        # ── Load SAR arrays ──────────────────────────────────────────────────
+        # ── Load SAR arrays (one scene; freed at end of iteration) ───────────
         arrays = _load_scene_arrays(image_path)
         if arrays is None:
-            log.warning("Skipping scene %s — could not load TIFF", scene_id)
+            log.warning("  [%d/%d] Skip %s — TIFF load failed", idx+1, n_scenes, scene_id)
             continue
         vv_db, vh_db = arrays
 
-        # ── Get binary mask ──────────────────────────────────────────────────
+        # ── Binary mask ───────────────────────────────────────────────────────
         mask = _load_mask(mask_path)
         if mask is None:
-            log.info("  No mask for %s — running M1 inference...", scene_id)
+            log.info("  [%d/%d] No GT mask for %s — running M1 inference...",
+                     idx+1, n_scenes, scene_id)
             mask = _run_m1_inference(image_path, m1_checkpoint, device)
         if mask is None:
-            log.warning("  Skipping scene %s — no mask and M1 inference failed.", scene_id)
+            log.warning("  [%d/%d] Skip %s — no mask & M1 inference failed.",
+                        idx+1, n_scenes, scene_id)
+            del vv_db, vh_db
+            gc.collect()
             continue
 
-        # ── Morphological closing + connected components ─────────────────────
+        # ── Morphological closing + connected components ──────────────────────
         _, regions = close_and_extract(
-            binary_mask   = mask,
-            iterations    = 2,
-            selem_size    = 5,
-            min_area_px   = args.min_component_px,
+            binary_mask = mask,
+            iterations  = 2,
+            selem_size  = 5,
+            min_area_px = args.min_component_px,
         )
+        del mask  # free immediately
         if not regions:
-            log.debug("  Scene %s: no components after closing — skipping.", scene_id)
+            log.debug("  [%d/%d] %s: no components — skip.", idx+1, n_scenes, scene_id)
+            del vv_db, vh_db
+            gc.collect()
             continue
 
-        # ── Ground-truth label map (all components in this scene get the scene label) ─
+        # ── Extract features NOW, then free raw arrays ────────────────────────
         label_map = {r.label: label_value for r in regions}
-
-        scene_dict: dict = {
+        scene_dict = {
             "scene_id":      scene_id,
             "regions":       regions,
             "vv_db":         vv_db,
             "vh_db":         vh_db,
-            "wind_speed_ms": 7.0,    # ERA5 fallback; integrate era5_cmems for production
-            "hour_local":    12,     # Scene acquisition hour; replace with scene metadata
+            "wind_speed_ms": 7.0,
+            "hour_local":    12,
             "label_map":     label_map,
         }
-        scene_dicts.append(scene_dict)
+        feat_df = build_feature_dataframe([scene_dict], gsd_m=args.gsd_m)
 
-        if (i % 50 == 0) or (i == n_scenes - 1):
-            log.info("  Processed %d/%d scenes...", i + 1, n_scenes)
+        # Free the large arrays immediately — don't keep them past this point
+        del vv_db, vh_db, scene_dict, regions
+        gc.collect()
 
-    log.info("Total usable scenes: %d → %d scene_dicts",
-             n_scenes, len(scene_dicts))
-    return scene_dicts
+        if not feat_df.empty:
+            partial_dfs.append(feat_df)
+            n_good += 1
+
+        # ── Progress + periodic checkpoint ────────────────────────────────────
+        if ((idx + 1) % 50 == 0) or (idx + 1 == n_scenes):
+            log.info("  Processed %d/%d scenes  (%d with features)...",
+                     idx + 1, n_scenes, n_good)
+
+        if checkpoint_path and n_good > 0 and (idx + 1) % checkpoint_every == 0:
+            _partial = pd.concat(partial_dfs, ignore_index=True)
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            _partial.to_csv(checkpoint_path, index=False)
+            log.info("  Checkpoint saved: %d rows → %s", len(_partial), checkpoint_path)
+            del _partial
+            gc.collect()
+
+    if not partial_dfs:
+        log.warning("No features extracted for class '%s'.", cls_name)
+        return pd.DataFrame()
+
+    result = pd.concat(partial_dfs, ignore_index=True)
+    log.info("'%s' done: %d scenes → %d component rows", cls_name, n_good, len(result))
+    return result
 
 
 # ─── Feature importance plot ───────────────────────────────────────────────────
@@ -431,39 +475,63 @@ def train(args: argparse.Namespace) -> None:
     full_pairs_df = pd.concat(all_dfs, ignore_index=True)
     log.info("Total scene pairs: %d", len(full_pairs_df))
 
-    # ── Build feature DataFrames by class ────────────────────────────────────
+    # ── Feature extraction (or cache reload) ─────────────────────────────────
     t0 = time.time()
-    feature_dfs: list[pd.DataFrame] = []
-
-    for cls_name, lbl in class_labels.items():
-        subset = full_pairs_df[full_pairs_df["_label_value"] == lbl].reset_index(drop=True)
-        if len(subset) == 0:
-            continue
-        log.info("Extracting features for class '%s' (%d scenes)...", cls_name, len(subset))
-        scene_dicts = _build_scene_dicts(
-            df_pairs      = subset,
-            m1_checkpoint = args.m1_checkpoint,
-            args          = args,
-            device        = device,
-            label_value   = lbl,
-        )
-        feat_df = build_feature_dataframe(scene_dicts, gsd_m=args.gsd_m)
-        log.info("  → %d component rows for class '%s'", len(feat_df), cls_name)
-        feature_dfs.append(feat_df)
-
-    if not feature_dfs:
-        raise RuntimeError("No features extracted. Check data directory and masks.")
-
-    all_features = pd.concat(feature_dfs, ignore_index=True)
-    log.info("Total feature rows: %d  (oil=%d, lookalike=%d)",
-             len(all_features),
-             int((all_features["label"] == 1).sum()),
-             int((all_features["label"] == 0).sum()))
-
-    # Save feature summary CSV
     feat_summary_path = metrics_dir / "feature_summary.csv"
-    all_features.to_csv(feat_summary_path, index=False)
-    log.info("Feature summary CSV: %s", feat_summary_path)
+
+    if getattr(args, "cached_features", False) and feat_summary_path.exists():
+        # ── CACHE PATH: reload pre-extracted features (useful after timeout) ──
+        log.info("--cached-features: loading pre-extracted features from %s",
+                 feat_summary_path)
+        all_features = pd.read_csv(feat_summary_path)
+        log.info("Loaded %d cached feature rows (oil=%d, lookalike=%d)",
+                 len(all_features),
+                 int((all_features["label"] == 1).sum()) if "label" in all_features.columns else -1,
+                 int((all_features["label"] == 0).sum()) if "label" in all_features.columns else -1)
+    else:
+        # ── FRESH PATH: extract features from raw TIFFs ────────────────────
+        if getattr(args, "cached_features", False):
+            log.warning("--cached-features set but %s not found — running fresh extraction.",
+                        feat_summary_path)
+
+        feature_dfs: list[pd.DataFrame] = []
+
+        for cls_name, lbl in class_labels.items():
+            subset = full_pairs_df[full_pairs_df["_label_value"] == lbl].reset_index(drop=True)
+            if len(subset) == 0:
+                continue
+            log.info("Extracting features for class '%s' (%d scenes)...", cls_name, len(subset))
+            # ── Streaming extraction: one scene at a time, raw arrays freed immediately.
+            # This avoids the N×16 MB RAM accumulation that caused OOM at scene ~550.
+            ckpt_path = metrics_dir / f"_partial_{cls_name}_features.csv"
+            feat_df = _extract_features_streaming(
+                df_pairs         = subset,
+                m1_checkpoint    = args.m1_checkpoint,
+                args             = args,
+                device           = device,
+                label_value      = lbl,
+                checkpoint_path  = ckpt_path,
+                checkpoint_every = 100,
+            )
+            log.info("  → %d component rows for class '%s'", len(feat_df), cls_name)
+            if not feat_df.empty:
+                feature_dfs.append(feat_df)
+            # Clean up the partial checkpoint file (data now in memory)
+            if ckpt_path.exists():
+                ckpt_path.unlink()
+
+        if not feature_dfs:
+            raise RuntimeError("No features extracted. Check data directory and masks.")
+
+        all_features = pd.concat(feature_dfs, ignore_index=True)
+        log.info("Total feature rows: %d  (oil=%d, lookalike=%d)",
+                 len(all_features),
+                 int((all_features["label"] == 1).sum()),
+                 int((all_features["label"] == 0).sum()))
+
+        # Save feature summary CSV (used as cache on restart)
+        all_features.to_csv(feat_summary_path, index=False)
+        log.info("Feature summary CSV: %s", feat_summary_path)
 
     # ── Train classifier ──────────────────────────────────────────────────────
     log.info("Training LookalikeClassifier (n_estimators=%d, n_folds=%d)...",
@@ -621,9 +689,15 @@ def _parse_args() -> argparse.Namespace:
                    help="Random Forest ensemble size (synopsis: 200)")
     p.add_argument("--seed",          type=int, default=42)
 
+    # Feature cache
+    p.add_argument("--cached-features", action="store_true",
+                   help="Reload feature_summary.csv from a prior run instead of "
+                        "re-extracting. Useful for restarting after a timeout that "
+                        "completed feature extraction but not RF training.")
+
     # HF Hub
     p.add_argument("--hf-repo-id", default="",
-                   help="HF Hub dataset repo ID for auto-upload")
+                   help="HF Hub repo ID for auto-upload (files stored under module2/)")
     p.add_argument("--hf-token",   default="",
                    help="HF Hub write access token (from Kaggle Secrets)")
 
