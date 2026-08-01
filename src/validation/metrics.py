@@ -33,8 +33,13 @@ def compute_miou(pred_mask, gt_mask, n_classes=2):
 
 
 def compute_pixel_f1(pred_mask, gt_mask):
-    """Binary pixel-level F1 -- flatten and treat every pixel as one sample."""
-    return f1_score(gt_mask.flatten(), pred_mask.flatten(), average="binary", zero_division=0)
+    """Binary pixel-level F1 -- flatten and treat every pixel as one sample.
+    If no positive pixels exist in GT and Pred, return NaN to avoid skewing average."""
+    pred_flat = pred_mask.flatten()
+    gt_flat   = gt_mask.flatten()
+    if gt_flat.sum() == 0 and pred_flat.sum() == 0:
+        return float("nan")
+    return float(f1_score(gt_flat, pred_flat, average="binary", zero_division=0))
 
 
 def composite_attribution_score(s_drift, s_ais_anomaly, s_morphology, s_temporal, weights=None):
