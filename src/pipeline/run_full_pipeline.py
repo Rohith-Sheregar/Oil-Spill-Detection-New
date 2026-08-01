@@ -39,6 +39,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.ais_attribution.pipeline import Module3Pipeline
+
+# Load Copernicus credentials from outputs/.env into os.environ
+# (CDSE_USER, CDSE_PASS, COPERNICUSMARINE_SERVICE_USERNAME, CDSAPI_KEY, …)
+from src.data_access.credentials import load_env as _load_env
+_load_env()
+
 from src.drift.lagrangian_drift import (
     compute_drift_similarity,
     run_backward_simulation,
