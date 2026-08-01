@@ -177,12 +177,15 @@ class LookalikeClassifier:
             from sklearn.metrics import balanced_accuracy_score, roc_auc_score
             y_val  = y[val_idx]
             y_pred = rf_fold.predict(X[val_idx])
-            y_prob = rf_fold.predict_proba(X[val_idx])[:, 1]
+            if len(rf_fold.classes_) > 1:
+                y_prob = rf_fold.predict_proba(X[val_idx])[:, 1]
+            else:
+                y_prob = np.zeros(len(val_idx))
 
             acc  = float((y_pred == y_val).mean())
             bacc = float(balanced_accuracy_score(y_val, y_pred))
             try:
-                auc = float(roc_auc_score(y_val, y_prob))
+                auc = float(roc_auc_score(y_val, y_prob)) if len(np.unique(y_val)) > 1 else float("nan")
             except Exception:
                 auc = float("nan")
 

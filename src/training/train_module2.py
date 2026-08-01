@@ -303,12 +303,12 @@ def _extract_features_streaming(
 
         # ── Binary mask ───────────────────────────────────────────────────────
         mask = _load_mask(mask_path)
-        if mask is None:
-            log.info("  [%d/%d] No GT mask for %s — running M1 inference...",
+        if mask is None or not mask.any():
+            log.info("  [%d/%d] No usable GT mask for %s — running M1 inference...",
                      idx+1, n_scenes, scene_id)
             mask = _run_m1_inference(image_path, m1_checkpoint, device)
-        if mask is None:
-            log.warning("  [%d/%d] Skip %s — no mask & M1 inference failed.",
+        if mask is None or not mask.any():
+            log.warning("  [%d/%d] Skip %s — no mask & M1 inference produced 0 components.",
                         idx+1, n_scenes, scene_id)
             del vv_db, vh_db
             gc.collect()
