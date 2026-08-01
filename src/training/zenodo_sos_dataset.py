@@ -281,16 +281,15 @@ def read_image_channels(
         return np.stack([vv, vh, vv - vh], axis=0)
 
     if input_mode in ("vv_vh_h_alpha", "full_5band"):
-        # ── Step 1: dB → linear power (required by Cloude-Pottier) ───────
-        from src.preprocessing.polsar_decomp import db_to_linear, dual_pol_entropy_alpha
+        # ── Step 1: dB → linear power (required by PolSAR decomp) ─────────
+        from src.preprocessing.polsar_decomp import db_to_linear, dual_pol_entropy_rvi
         vv_lin = db_to_linear(vv)    # σ₀_VV in linear power
         vh_lin = db_to_linear(vh)    # σ₀_VH in linear power
 
-        # ── Step 2: Cloude-Pottier H and α ─────────────────────────────────
-        # dual_pol_entropy_alpha() expects LINEAR-scale inputs (not dB)
-        band_H, band_alpha = dual_pol_entropy_alpha(vv_lin, vh_lin)
-        # H ∈ [0, 1] already; α ∈ [0°, 90°] → normalise to [0, 1]
-        band_a = (band_alpha / 90.0).astype(np.float32)
+        # ── Step 2: Entropy H and RVI_dp ─────────────────────────────────
+        band_H, band_rvi_raw = dual_pol_entropy_rvi(vv_lin, vh_lin)
+        # H ∈ [0, 1] already; RVI_dp normalized to [0, 1] via / 2.0 clamp
+        band_rvi = np.clip(band_rvi_raw / 2.0, 0.0, 1.0).astype(np.float32)
 
         # ── Step 3: robust percentile-stretch VV and VH (dB → [0, 1]) ────
         def _pstretch(arr: np.ndarray) -> np.ndarray:
@@ -306,9 +305,9 @@ def read_image_channels(
         vh_norm = _pstretch(vh)
 
         if input_mode == "vv_vh_h_alpha":
-            return np.stack([vv_norm, vh_norm, band_H, band_a], axis=0)
+            return np.stack([vv_norm, vh_norm, band_H, band_rvi], axis=0)
 
-        # ── Step 4: Band 5 — CMOD5.N wind-corrected ratio ─────────────────
+        # ── Step 4: Band 4 — CMOD5.N wind-corrected ratio ─────────────────
         # compute_wind_corrected_ratio() handles its own dB→linear internally
         from src.preprocessing.wind_ratio import compute_wind_corrected_ratio
         band_w = compute_wind_corrected_ratio(

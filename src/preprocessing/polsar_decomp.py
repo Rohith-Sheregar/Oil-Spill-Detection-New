@@ -62,9 +62,11 @@ def _t2_eigenvalues(
         T2 = [[|VV|²,    VV·VH*],
               [VH·VV*,   |VH|² ]]
 
-    For GRD data the off-diagonal cross-terms are real (no phase information),
-    so T2 is symmetric. The eigenvalues of a 2×2 symmetric real matrix are:
-        λ₁,₂ = trace/2 ± sqrt((trace/2)² − det)
+    For GRD data, complex phase is unrecorded. Setting off-diagonal t12 = sqrt(t11*t22)
+    forces det(T2) = 0 identically for all pixels, rendering l2 = 0 and H = 0 everywhere.
+    Setting t12 = 0 (zero-correlation assumption) is the standard uninformative default
+    without phase information. It yields eigenvalues l1 = max(t11, t22) and l2 = min(t11, t22),
+    allowing Entropy H to vary meaningfully with per-pixel VV/VH power ratio.
 
     Parameters
     ----------
@@ -77,10 +79,10 @@ def _t2_eigenvalues(
     """
     t11 = vv_lin + eps          # |VV|²  (diagonal element)
     t22 = vh_lin + eps          # |VH|²  (diagonal element)
-    t12 = np.sqrt(t11 * t22)    # cross-term magnitude approximation for GRD
+    t12 = np.zeros_like(t11)    # zero-correlation default without phase (prevents det=0 degradation)
 
     trace = t11 + t22
-    det   = t11 * t22 - t12 ** 2
+    det   = np.maximum(t11 * t22 - t12 ** 2, 0.0)
     disc  = np.sqrt(np.maximum(trace ** 2 / 4.0 - det, 0.0))
 
     l1 = trace / 2.0 + disc
@@ -88,20 +90,33 @@ def _t2_eigenvalues(
     return l1.astype(np.float32), l2.astype(np.float32)
 
 
-# ─── Primary public function ───────────────────────────────────────────────────
+# ─── Dual-Pol Entropy & RVI_dp Functions ─────────────────────────────────────
 
-def dual_pol_entropy_alpha(
+def compute_rvi_dp(
+    vv_linear: np.ndarray,
+    vh_linear: np.ndarray,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    Compute dual-pol Radar Vegetation Index (RVI_dp).
+
+    Formula: RVI_dp = 4 * VH_lin / (VV_lin + VH_lin)
+    Provides a phase-free, independent physical descriptor of surface roughness
+    and depolarisation on the ocean.
+    """
+    vv_lin = np.maximum(np.asarray(vv_linear, dtype=np.float32), eps)
+    vh_lin = np.maximum(np.asarray(vh_linear, dtype=np.float32), eps)
+    return (4.0 * vh_lin / (vv_lin + vh_lin + eps)).astype(np.float32)
+
+
+def dual_pol_entropy_rvi(
     vv_linear: np.ndarray,
     vh_linear: np.ndarray,
     eps: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute Cloude-Pottier Entropy H and mean Alpha angle α from dual-pol
-    Sentinel-1 GRD data in **linear** power scale.
-
-    This is the canonical entry-point referenced by zenodo_sos_dataset.py
-    and band_stack.py. Always pass linear-scale values here; convert from
-    dB upstream using `db_to_linear()` or `dual_pol_entropy_alpha_from_db()`.
+    Compute Cloude-Pottier Entropy H and dual-pol Radar Vegetation Index (RVI_dp)
+    from dual-pol Sentinel-1 GRD data in linear power scale.
 
     Parameters
     ----------
@@ -111,12 +126,8 @@ def dual_pol_entropy_alpha(
 
     Returns
     -------
-    H     : Entropy,     float32 (H, W), values clipped to [0, 1]
-            H ≈ 0 → single dominant scattering mechanism (specular/calm ocean)
-            H ≈ 1 → depolarising, complex medium (oil layer, rough sea, etc.)
-    alpha : Alpha angle, float32 (H, W), values clipped to [0, 90] degrees
-            α < 45° → surface/Bragg scattering
-            α > 45° → volume/double-bounce scattering (oil multipaths)
+    H      : Entropy, float32 (H, W), clipped to [0, 1]
+    rvi_dp : Dual-pol RVI, float32 (H, W), unnormalized >= 0
     """
     vv_lin = np.asarray(vv_linear, dtype=np.float32)
     vh_lin = np.asarray(vh_linear, dtype=np.float32)
@@ -129,20 +140,33 @@ def dual_pol_entropy_alpha(
     p2 = l2 / sum_l
 
     # Shannon entropy — normalised to [0, 1] for N=2 scattering mechanisms
-    # (log₂(2) = 1, so division by log₂(N) = 1 for N=2 is implicit)
     H = -(
         p1 * np.log2(np.maximum(p1, eps))
         + p2 * np.log2(np.maximum(p2, eps))
     )
     H = np.clip(H, 0.0, 1.0).astype(np.float32)
 
-    # Mean alpha angle via arctan2(sqrt(p2), sqrt(p1))
-    # For dual-pol this maps naturally to [0°, 45°]; multiply by 2 to
-    # match the [0°, 90°] convention of the full quad-pol Cloude-Pottier.
-    alpha_raw = np.degrees(np.arctan2(np.sqrt(p2 + eps), np.sqrt(p1 + eps)))
-    alpha     = np.clip(alpha_raw * 2.0, 0.0, 90.0).astype(np.float32)
+    # RVI_dp calculation
+    rvi_dp = compute_rvi_dp(vv_lin, vh_lin, eps=eps)
 
-    return H, alpha
+    return H, rvi_dp
+
+
+def dual_pol_entropy_alpha(
+    vv_linear: np.ndarray,
+    vh_linear: np.ndarray,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Backward-compatible alias: calls `dual_pol_entropy_rvi()` and returns (H, rvi_dp).
+    Note: Scattering angle alpha requires complex phase (unavailable in GRD).
+    The second returned element is RVI_dp (dual-pol Radar Vegetation Index).
+    """
+    import logging
+    logging.getLogger(__name__).debug(
+        "dual_pol_entropy_alpha called: returning (H, rvi_dp) — GRD has no phase for true alpha."
+    )
+    return dual_pol_entropy_rvi(vv_linear, vh_linear, eps=eps)
 
 
 def dual_pol_entropy_alpha_from_db(
@@ -152,21 +176,11 @@ def dual_pol_entropy_alpha_from_db(
     eps: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Convenience wrapper: accepts Sigma0 dB inputs (as stored in Zenodo TIFFs)
-    and converts to linear before calling `dual_pol_entropy_alpha()`.
-
-    Parameters
-    ----------
-    vv_db, vh_db : (H, W) float32 arrays, Sigma0 in decibels
-    clip_db      : floor clamp before exponentiation (default -50 dB)
-
-    Returns
-    -------
-    H, alpha — same as `dual_pol_entropy_alpha()`
+    Convenience wrapper: accepts Sigma0 dB inputs and converts to linear before calling `dual_pol_entropy_rvi()`.
     """
     vv_lin = db_to_linear(vv_db, clip_db=clip_db)
     vh_lin = db_to_linear(vh_db, clip_db=clip_db)
-    return dual_pol_entropy_alpha(vv_lin, vh_lin, eps=eps)
+    return dual_pol_entropy_rvi(vv_lin, vh_lin, eps=eps)
 
 
 def compute_anisotropy_placeholder(shape_hw: tuple[int, int]) -> np.ndarray:

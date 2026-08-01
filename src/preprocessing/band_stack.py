@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-from src.preprocessing.polsar_decomp import db_to_linear, dual_pol_entropy_alpha
+from src.preprocessing.polsar_decomp import db_to_linear, dual_pol_entropy_rvi
 from src.preprocessing.wind_ratio import compute_wind_corrected_ratio
 
 
@@ -78,12 +78,11 @@ def build_5band_stack(
     band_vv = vv_db.copy()
     band_vh = vh_db.copy()
 
-    # ── Band 2+3: H and alpha (Cloude-Pottier) ────────────────────────────
-    # Convert dB → linear before calling dual_pol_entropy_alpha()
-    vv_lin  = db_to_linear(vv_db)
-    vh_lin  = db_to_linear(vh_db)
-    band_H, band_alpha_deg = dual_pol_entropy_alpha(vv_lin, vh_lin)
-    band_alpha = band_alpha_deg / 90.0   # normalise [0°, 90°] → [0, 1]
+    # ── Band 2+3: H and RVI_dp (dual-pol descriptors) ─────────────────────
+    vv_lin = db_to_linear(vv_db)
+    vh_lin = db_to_linear(vh_db)
+    band_H, band_rvi_raw = dual_pol_entropy_rvi(vv_lin, vh_lin)
+    band_rvi = np.clip(band_rvi_raw / 2.0, 0.0, 1.0).astype(np.float32)  # normalize RVI_dp
 
     # ── Band 4: wind-corrected ratio ──────────────────────────────────────
     band_wind = compute_wind_corrected_ratio(
@@ -93,13 +92,13 @@ def build_5band_stack(
         wind_dir_deg=wind_dir_deg,
     )
 
-    bands = [band_vv, band_vh, band_H, band_alpha, band_wind]
+    bands = [band_vv, band_vh, band_H, band_rvi, band_wind]
 
     if normalize:
-        # H, alpha, wind_ratio already in [0,1]; normalise VV/VH dB bands
+        # H, RVI_dp, wind_ratio already in [0,1]; normalise VV/VH dB bands
         bands[0] = _robust_norm(bands[0])
         bands[1] = _robust_norm(bands[1])
-        # H and alpha are already [0, 1] — re-clip for safety
+        # H, RVI_dp, and wind-ratio are already [0, 1] — re-clip for safety
         bands[2] = np.clip(bands[2], 0.0, 1.0)
         bands[3] = np.clip(bands[3], 0.0, 1.0)
         bands[4] = np.clip(bands[4], 0.0, 1.0)
@@ -143,7 +142,7 @@ def build_5band_from_tiff(
     )
 
 
-BAND_NAMES = ["VV (dB)", "VH (dB)", "Entropy H", "Alpha (norm)", "Wind-ratio"]
+BAND_NAMES = ["VV (dB)", "VH (dB)", "Entropy H", "RVI_dp (norm)", "Wind-ratio"]
 
 
 # ─── smoke test ──────────────────────────────────────────────────────────────

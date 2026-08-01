@@ -55,7 +55,7 @@ FEATURE_NAMES: list[str] = [
     # Polarimetric (Song et al. 2024; Chen & Wang 2022)
     "mean_H",                   # Entropy H ∈ [0, 1]
     "anisotropy_A",             # Always 0.0 for dual-pol (see module docstring)
-    "mean_alpha_deg",           # Cloude-Pottier α ∈ [0°, 90°]
+    "mean_rvi_dp",              # Dual-pol Radar Vegetation Index (RVI_dp)
     "copol_ratio_VV_VH",        # VV_lin / VH_lin (linear scale, per-patch mean)
     # Geometric (Yang et al. 2022)
     "area_km2",                 # Component area in km²
@@ -220,7 +220,7 @@ def _extract_region_features(
 
     mean_H            = float(H_map[ys, xs].mean())
     anisotropy_A      = 0.0          # Degenerate: dual-pol, see module docstring
-    mean_alpha_deg    = float(alpha_map_deg[ys, xs].mean())
+    mean_rvi_dp       = float(alpha_map_deg[ys, xs].mean())
     copol_ratio_VV_VH = float(vv_lin_vals.mean() / max(vh_lin_vals.mean(), 1e-9))
 
     # ── Geometric features (Yang et al. 2022) ───────────────────────────────
@@ -257,7 +257,7 @@ def _extract_region_features(
         # Polarimetric
         "mean_H":              mean_H,
         "anisotropy_A":        anisotropy_A,
-        "mean_alpha_deg":      mean_alpha_deg,
+        "mean_rvi_dp":         mean_rvi_dp,
         "copol_ratio_VV_VH":   copol_ratio_VV_VH,
         # Geometric
         "area_km2":            area_km2,
