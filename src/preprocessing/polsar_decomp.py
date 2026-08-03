@@ -158,15 +158,56 @@ def dual_pol_entropy_alpha(
     eps: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Backward-compatible alias: calls `dual_pol_entropy_rvi()` and returns (H, rvi_dp).
-    Note: Scattering angle alpha requires complex phase (unavailable in GRD).
-    The second returned element is RVI_dp (dual-pol Radar Vegetation Index).
+    Compute Cloude-Pottier Entropy H and mean Alpha angle α from dual-pol
+    Sentinel-1 GRD data in **linear** power scale.
+
+    This is the primary function for the 5-band feature stack (Band 2 = H,
+    Band 3 = alpha_norm). It uses the T2 coherency matrix eigenvalues, the
+    same approach that was used when training best_model.pt (commit c385b04).
+
+    The dual-pol alpha naturally falls in [0°, 45°] (T2 has only 2 mechanisms).
+    We multiply by 2 to map it to the conventional [0°, 90°] Cloude-Pottier
+    range so that Band 3 can be normalised to [0, 1] by dividing by 90.
+
+    Parameters
+    ----------
+    vv_linear : (H, W) float32 — VV σ₀ in linear power (NOT dB)
+    vh_linear : (H, W) float32 — VH σ₀ in linear power (NOT dB)
+    eps       : numerical stability floor (default 1e-12)
+
+    Returns
+    -------
+    H     : Entropy, float32 (H, W), clipped to [0, 1]
+              H ≈ 0 → single dominant scattering mechanism (smooth water)
+              H ≈ 1 → depolarising, complex medium (oil layer, rough sea)
+    alpha : Alpha angle, float32 (H, W), clipped to [0°, 90°]
+              α < 45° → surface/Bragg scattering
+              α > 45° → volume/dihedral scattering
     """
-    import logging
-    logging.getLogger(__name__).debug(
-        "dual_pol_entropy_alpha called: returning (H, rvi_dp) — GRD has no phase for true alpha."
+    vv_lin = np.asarray(vv_linear, dtype=np.float32)
+    vh_lin = np.asarray(vh_linear, dtype=np.float32)
+
+    l1, l2 = _t2_eigenvalues(vv_lin, vh_lin, eps=eps)
+    sum_l  = l1 + l2 + eps
+
+    # Pseudo-probabilities (fractional eigenvalue contributions)
+    p1 = l1 / sum_l
+    p2 = l2 / sum_l
+
+    # Shannon entropy — normalised to [0, 1] for N=2 scattering mechanisms
+    H = -(
+        p1 * np.log2(np.maximum(p1, eps))
+        + p2 * np.log2(np.maximum(p2, eps))
     )
-    return dual_pol_entropy_rvi(vv_linear, vh_linear, eps=eps)
+    H = np.clip(H, 0.0, 1.0).astype(np.float32)
+
+    # Mean alpha angle via arctan2(sqrt(p2), sqrt(p1)).
+    # For dual-pol this maps naturally to [0°, 45°]; multiply by 2 to
+    # match the [0°, 90°] convention of the full quad-pol Cloude-Pottier.
+    alpha_raw = np.degrees(np.arctan2(np.sqrt(p2 + eps), np.sqrt(p1 + eps)))
+    alpha     = np.clip(alpha_raw * 2.0, 0.0, 90.0).astype(np.float32)
+
+    return H, alpha
 
 
 def dual_pol_entropy_alpha_from_db(

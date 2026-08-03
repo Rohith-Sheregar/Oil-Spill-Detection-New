@@ -281,15 +281,18 @@ def read_image_channels(
         return np.stack([vv, vh, vv - vh], axis=0)
 
     if input_mode in ("vv_vh_h_alpha", "full_5band"):
-        # ── Step 1: dB → linear power (required by PolSAR decomp) ─────────
-        from src.preprocessing.polsar_decomp import db_to_linear, dual_pol_entropy_rvi
+        # ── Step 1: dB → linear power (required by Cloude-Pottier) ─────────
+        from src.preprocessing.polsar_decomp import db_to_linear, dual_pol_entropy_alpha
         vv_lin = db_to_linear(vv)    # σ₀_VV in linear power
         vh_lin = db_to_linear(vh)    # σ₀_VH in linear power
 
-        # ── Step 2: Entropy H and RVI_dp ─────────────────────────────────
-        band_H, band_rvi_raw = dual_pol_entropy_rvi(vv_lin, vh_lin)
-        # H ∈ [0, 1] already; RVI_dp normalized to [0, 1] via / 2.0 clamp
-        band_rvi = np.clip(band_rvi_raw / 2.0, 0.0, 1.0).astype(np.float32)
+        # ── Step 2: Cloude-Pottier H and α ───────────────────────────────────
+        # dual_pol_entropy_alpha() expects LINEAR-scale inputs (not dB).
+        # Returns H ∈ [0, 1] and alpha ∈ [0°, 90°] (dual-pol range ×2 convention).
+        # This matches exactly what best_model.pt (epoch 8) was trained with.
+        band_H, band_alpha = dual_pol_entropy_alpha(vv_lin, vh_lin)
+        # Normalise alpha to [0, 1] by dividing by 90° (training convention)
+        band_a = (band_alpha / 90.0).astype(np.float32)
 
         # ── Step 3: robust percentile-stretch VV and VH (dB → [0, 1]) ────
         def _pstretch(arr: np.ndarray) -> np.ndarray:
@@ -305,7 +308,7 @@ def read_image_channels(
         vh_norm = _pstretch(vh)
 
         if input_mode == "vv_vh_h_alpha":
-            return np.stack([vv_norm, vh_norm, band_H, band_rvi], axis=0)
+            return np.stack([vv_norm, vh_norm, band_H, band_a], axis=0)
 
         # ── Step 4: Band 4 — CMOD5.N wind-corrected ratio ─────────────────
         # compute_wind_corrected_ratio() handles its own dB→linear internally
@@ -317,8 +320,8 @@ def read_image_channels(
             wind_dir_deg=wind_dir_deg,
         )
 
-        # ── Stack: [VV_norm, VH_norm, H, RVI_dp_norm, wind_ratio] ─────────
-        return np.stack([vv_norm, vh_norm, band_H, band_rvi, band_w], axis=0)
+        # ── Stack: [VV_norm, VH_norm, H, alpha_norm, wind_ratio] ─────────
+        return np.stack([vv_norm, vh_norm, band_H, band_a, band_w], axis=0)
 
     raise ValueError(f"Unsupported input_mode={input_mode!r}")
 
