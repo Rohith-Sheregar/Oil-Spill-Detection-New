@@ -10,10 +10,10 @@ A complete forensic pipeline for detecting illegal bilge-dump oil spills in Sent
 
 | Module | Description | Status |
 |--------|-------------|--------|
-| **Module 1** | DeepLabV3+ SAR segmentation | ✅ Trained — epoch 8, mIoU 0.8135 |
-| **Module 2** | Random Forest look-alike discriminator | ✅ Trained — 1,200 scenes |
-| **Module 3** | AIS vessel candidate filtering + anomaly detection | ✅ Implemented & smoke-tested |
-| **Module 4** | Lagrangian drift + composite attribution scoring | ✅ Implemented & smoke-tested |
+| **Module 1** | DeepLabV3+ SAR segmentation | ✅ Trained — epoch 8, mIoU **0.8135** (val), test eval pending |
+| **Module 2** | Random Forest look-alike discriminator | ✅ Trained — 1,200 scenes, CV results in HF Hub |
+| **Module 3** | AIS vessel candidate filtering + anomaly detection | ✅ Implemented & smoke-tested — real-data eval requires NOAA AIS CSV |
+| **Module 4** | Lagrangian drift + composite attribution scoring | ✅ Implemented & smoke-tested — real-data eval requires ERA5 + CMEMS netCDF |
 
 ---
 
@@ -70,9 +70,17 @@ Sentinel-1 IW GRD TIFF
 
 ```
 Oil_spill_detection/
-├── notebooks/                            # Kaggle training notebooks
+├── notebooks/                            # Kaggle training + evaluation notebooks
 │   ├── module-1-training.ipynb           # M1: DeepLabV3+ SAR segmentation
-│   └── module-2-training.ipynb           # M2: Random Forest look-alike training
+│   ├── module-2-training.ipynb           # M2: Random Forest look-alike training
+│   └── evaluate_models_on_test_set.ipynb # M1 evaluation: alpha vs RVI_dp mismatch
+│
+├── audit_reports/                        # Module implementation audits
+│   ├── module1_audit.md                  # M1 architecture + training audit
+│   ├── module2_audit.md                  # M2 feature + classifier audit
+│   ├── module3_audit.md                  # M3 AIS pipeline audit + smoke tests
+│   ├── module4_audit.md                  # M4 drift + scoring audit + smoke tests
+│   └── rvi_dp_migration_audit.md         # Alpha→RVI_dp migration forensics
 │
 ├── src/
 │   ├── __init__.py
@@ -272,6 +280,25 @@ python -m src.training.train_module2 \
     --hf-token $HF_TOKEN
 ```
 
+### Module 1 — Test Set Evaluation (Kaggle)
+
+Open [`notebooks/evaluate_models_on_test_set.ipynb`](notebooks/evaluate_models_on_test_set.ipynb) on Kaggle.
+This compares the model in the correct **Alpha mode** vs the mismatched **RVI_dp mode**:
+
+| Mode | Band 3 | Expected result |
+|---|---|---|
+| Alpha (matches training) | `arctan2(√p₂,√p₁)×2/90` | ~0.81 mIoU |
+| RVI_dp (mismatch) | `4·VH/(VV+VH)/2` | Degraded |
+
+> Results below — update once eval notebook completes:
+
+| Metric | Alpha mode | RVI_dp mode | Δ |
+|--------|-----------|------------|---|
+| mIoU | *(pending)* | *(pending)* | *(pending)* |
+| F1 | *(pending)* | *(pending)* | *(pending)* |
+| Precision | *(pending)* | *(pending)* | *(pending)* |
+| Recall | *(pending)* | *(pending)* | *(pending)* |
+
 ### Module 2 Results
 
 <!-- PLACEHOLDER: Add feature importance bar chart here -->
@@ -279,9 +306,10 @@ python -m src.training.train_module2 \
 
 | Metric | Value |
 |--------|-------|
-| CV Balanced Accuracy | *(see cv_scores.json)* |
-| CV AUC | *(see cv_scores.json)* |
-| OOB Score | *(see cv_scores.json)* |
+| CV Balanced Accuracy | *(fill from `cv_scores.json` on HF Hub)* |
+| CV AUC | *(fill from `cv_scores.json` on HF Hub)* |
+| OOB Score | *(fill from `cv_scores.json` on HF Hub)* |
+| Top feature | *(fill from `feature_importance.csv`)* |
 
 ---
 
@@ -334,7 +362,64 @@ Each run produces a JSON forensic report in `results/forensic_reports/`:
 
 ---
 
-## Data Sources
+## Module 3 & 4 Evaluation Guide
+
+Modules 3 and 4 are **rule-based + physics-based** (not trained ML) — they don't have a held-out test set. Evaluation uses two approaches:
+
+### Option A — End-to-end real-scene smoke test
+
+```bash
+# 1. Get a Sentinel-1 test scene (see Getting a Sentinel-1 Test Scene below)
+# 2. Download NOAA AIS CSV for the scene date/location
+# 3. Run full pipeline
+python -m src.pipeline.run_full_pipeline \
+    --sar-tiff   data/test/scene.tif \
+    --m1-weights results/module1/checkpoints/best_model.pt \
+    --m2-weights results/module2/checkpoints/lookalike_rf.joblib \
+    --ais-csv    data/ais/AIS_2026_03_Zone15.csv \
+    --sar-time   2026-03-15T09:00:00Z \
+    --output-dir results/forensic_reports
+```
+
+Check the JSON output in `results/forensic_reports/` — it should contain:
+- `n_dark_patches` > 0 (M1 found something)
+- `n_bilge_candidates` ≥ 0 (M2 filtered it)
+- `vessel_attributions` with `composite_score` ∈ [0, 1]
+
+### Option B — Unit-level smoke tests (no real data needed)
+
+```bash
+# Module 3 — AIS pipeline smoke tests
+python -m pytest src/ais_attribution/ -v
+# OR run the built-in smoke tests at bottom of each file:
+python src/ais_attribution/trajectory_cleaning.py
+python src/ais_attribution/anomaly_detection.py
+python src/ais_attribution/dark_ship.py
+python src/ais_attribution/pipeline.py
+
+# Module 4 — Drift + scoring smoke tests
+python src/drift/lagrangian_drift.py
+python src/drift/scoring.py
+```
+
+All 4 Module 3 files and both Module 4 files have built-in `if __name__ == "__main__"` smoke tests. Results are in [`audit_reports/module3_audit.md`](audit_reports/module3_audit.md) and [`audit_reports/module4_audit.md`](audit_reports/module4_audit.md).
+
+### What the smoke test output means
+
+| M3 output | Healthy sign |
+|---|---|
+| `Tier-1 candidates: N` (N > 0 with real AIS) | Anomaly detector working |
+| `Dark ships: K` | FTM detection working |
+| `elapsed_s < 5.0` | No performance regression |
+
+| M4 output | Healthy sign |
+|---|---|
+| `forward_particles: 1000` | Drift simulation initialized |
+| `composite_score ∈ [0, 1]` | Scoring formula correct |
+| `backward_origin` lon/lat near vessel | Physics plausible |
+
+---
+
 
 | Data | Source | Access | Used By |
 |------|--------|--------|---------|
